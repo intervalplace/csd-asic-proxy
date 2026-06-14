@@ -143,7 +143,7 @@ fn send_msg(w: &Arc<Mutex<TcpStream>>, v: Value) {
 fn main() {
     let upstream_addr  = std::env::var("CSD_UPSTREAM").unwrap_or_else(|_| "127.0.0.1:3333".to_string());
     let listen_addr    = std::env::var("PROXY_LISTEN").unwrap_or_else(|_| "0.0.0.0:3334".to_string());
-    let proxy_password = std::env::var("PROXY_PASSWORD").ok();
+    let proxy_password = std::env::var("csdproxy2").ok();
 
     println!("[proxy] upstream:  {}", upstream_addr);
     println!("[proxy] listening: {}", listen_addr);
