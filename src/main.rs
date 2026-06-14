@@ -10,11 +10,7 @@
 //   [76..80] bits     u32 LE
 //   [80..84] nonce    u32 LE
 //
-// The hash result is treated as a 32-byte big-endian array and compared
-// against the target (also big-endian). See PowTarget::check in pow.rs.
-//
-// ASIC nonce submission: the nonce arrives as a hex string of the raw LE bytes.
-// e.g. nonce_hex="81363301" means bytes [0x81,0x36,0x33,0x01] go into [80..84].
+// CRITICAL: we forward the real upstream en1 to the ASIC so merkle roots match.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -41,7 +37,7 @@ fn to_hex(data: &[u8]) -> String {
     data.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-// Matches bits_to_target_bytes in pow.rs exactly
+// Matches bits_to_target_bytes in pow.rs
 fn bits_to_target(bits: u32) -> [u8; 32] {
     let exp = ((bits >> 24) & 0xff) as usize;
     let mant = bits & 0x00ff_ffff;
@@ -49,7 +45,6 @@ fn bits_to_target(bits: u32) -> [u8; 32] {
     if exp == 0 || mant == 0 || (mant & 0x0080_0000) != 0 || exp > 32 {
         return target;
     }
-    // Place mantissa bytes at offset (32 - exp)
     let off = 32usize.saturating_sub(exp);
     if off + 3 <= 32 {
         target[off]     = ((mant >> 16) & 0xff) as u8;
@@ -59,7 +54,7 @@ fn bits_to_target(bits: u32) -> [u8; 32] {
     target
 }
 
-// Matches PowTarget::check in pow.rs: hash <= target (both BE byte arrays)
+// Matches PowTarget::check in pow.rs
 fn hash_meets_target(hash: &[u8; 32], target: &[u8; 32]) -> bool {
     hash <= target
 }
@@ -81,7 +76,6 @@ struct Job {
     proxy_job_id:  String,
     csd_job_id:    String,
     target:        [u8; 32],
-    en2_hex:       String,
     ntime_hex:     String,
     coinbase1:     Vec<u8>,
     coinbase2:     Vec<u8>,
@@ -89,8 +83,8 @@ struct Job {
     version:       u32,
     bits:          u32,
     prev:          [u8; 32],
-    // Full u64 time from CSD stratum (ntime is only low 32 bits)
     time64:        u64,
+    en2_size:      usize,
 }
 
 fn make_notify(job: &Job, clean: bool) -> Value {
@@ -127,20 +121,15 @@ fn reconstruct_merkle(job: &Job, en1: &[u8], en2: &[u8]) -> [u8; 32] {
     cur
 }
 
-// Build the 84-byte CSD header exactly as header_hash() expects.
-// nonce_bytes: raw 4 bytes as received from ASIC (already in correct LE order).
 fn build_csd_header(job: &Job, merkle: &[u8; 32], ntime32: u32, nonce_bytes: &[u8; 4]) -> [u8; 84] {
     let mut hdr = [0u8; 84];
     hdr[0..4].copy_from_slice(&job.version.to_le_bytes());
     hdr[4..36].copy_from_slice(&job.prev);
     hdr[36..68].copy_from_slice(merkle);
-    // CSD time is u64 LE. ntime32 is the low 32 bits sent by the ASIC.
-    // High 32 bits come from original job time64.
     let time_hi = (job.time64 >> 32) as u32;
     let full_time: u64 = ((time_hi as u64) << 32) | (ntime32 as u64);
     hdr[68..76].copy_from_slice(&full_time.to_le_bytes());
     hdr[76..80].copy_from_slice(&job.bits.to_le_bytes());
-    // Nonce: write raw bytes as-is (ASIC sends them in the right LE order)
     hdr[80..84].copy_from_slice(nonce_bytes);
     hdr
 }
@@ -163,6 +152,10 @@ fn main() {
     let recent_jobs: Arc<Mutex<HashMap<String, Job>>> = Arc::new(Mutex::new(HashMap::new()));
     let asic_clients: Arc<Mutex<Vec<Arc<Mutex<TcpStream>>>>> = Arc::new(Mutex::new(Vec::new()));
 
+    // Shared upstream en1 â set once on subscribe, read by ASIC handlers
+    let upstream_en1: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![0u8; 4]));
+    let upstream_en2_size: Arc<Mutex<usize>> = Arc::new(Mutex::new(4));
+
     // Connect upstream
     let up_stream = TcpStream::connect(&upstream_addr).expect("cannot connect to CSD upstream");
     let up_writer = Arc::new(Mutex::new(up_stream.try_clone().unwrap()));
@@ -180,15 +173,15 @@ fn main() {
 
     // Upstream reader thread
     {
-        let current_job  = current_job.clone();
-        let recent_jobs  = recent_jobs.clone();
-        let asic_clients = asic_clients.clone();
-        let up_reader    = up_stream;
+        let current_job      = current_job.clone();
+        let recent_jobs      = recent_jobs.clone();
+        let asic_clients     = asic_clients.clone();
+        let upstream_en1     = upstream_en1.clone();
+        let upstream_en2_size = upstream_en2_size.clone();
+        let up_reader        = up_stream;
 
         thread::spawn(move || {
             let reader = BufReader::new(up_reader);
-            let mut en1_hex  = String::new();
-            let mut en2_size = 4usize;
             let mut seq: u64 = 0;
 
             for line in reader.lines() {
@@ -198,12 +191,15 @@ fn main() {
                 let method = msg.get("method").and_then(|v| v.as_str()).unwrap_or("");
 
                 if method.is_empty() {
-                    // Subscribe response
+                    // Subscribe response â extract en1 and en2_size
                     if let Some(arr) = msg.get("result").and_then(|v| v.as_array()) {
                         if arr.len() >= 3 {
-                            en1_hex  = arr[1].as_str().unwrap_or("").to_string();
-                            en2_size = arr[2].as_u64().unwrap_or(4) as usize;
+                            let en1_hex  = arr[1].as_str().unwrap_or("").to_string();
+                            let en2_size = arr[2].as_u64().unwrap_or(4) as usize;
+                            let en1_bytes = from_hex(&en1_hex);
                             println!("[upstream] en1={} en2_size={}", en1_hex, en2_size);
+                            *upstream_en1.lock().unwrap() = en1_bytes;
+                            *upstream_en2_size.lock().unwrap() = en2_size;
                         }
                     }
                     continue;
@@ -228,8 +224,8 @@ fn main() {
                 let coinbase2  = from_hex(p[3].as_str().unwrap_or(""));
                 let version    = u32::from_str_radix(p[5].as_str().unwrap_or("1"), 16).unwrap_or(1);
                 let bits       = u32::from_str_radix(p[6].as_str().unwrap_or("0"), 16).unwrap_or(0);
-                let ntime_str  = p[7].as_str().unwrap_or("0");
-                let ntime32    = u32::from_str_radix(ntime_str, 16).unwrap_or(0);
+                let ntime_str  = p[7].as_str().unwrap_or("0").to_string();
+                let ntime32    = u32::from_str_radix(&ntime_str, 16).unwrap_or(0);
                 let clean      = p[8].as_bool().unwrap_or(false);
 
                 let mut prev = [0u8; 32];
@@ -238,22 +234,22 @@ fn main() {
                 let merkle_branch: Vec<[u8; 32]> = p[4].as_array().unwrap_or(&vec![])
                     .iter().filter_map(|v| {
                         let b = from_hex(v.as_str().unwrap_or(""));
-                        if b.len() == 32 { let mut a = [0u8;32]; a.copy_from_slice(&b); Some(a) } else { None }
+                        if b.len() == 32 {
+                            let mut a = [0u8;32]; a.copy_from_slice(&b); Some(a)
+                        } else { None }
                     }).collect();
 
-                let target = bits_to_target(bits);
+                let target   = bits_to_target(bits);
+                let en2_size = *upstream_en2_size.lock().unwrap();
+
                 seq += 1;
                 let proxy_job_id = format!("{:08x}", seq);
-
-                // en2 = zeros for the job template
-                let en2 = vec![0u8; en2_size];
 
                 let job = Job {
                     proxy_job_id: proxy_job_id.clone(),
                     csd_job_id:   csd_job_id.clone(),
                     target,
-                    en2_hex:      to_hex(&en2),
-                    ntime_hex:    ntime_str.to_string(),
+                    ntime_hex:    ntime_str,
                     coinbase1,
                     coinbase2,
                     merkle_branch,
@@ -261,9 +257,11 @@ fn main() {
                     bits,
                     prev,
                     time64:       ntime32 as u64,
+                    en2_size,
                 };
 
-                println!("[upstream] job={} bits={:08x} target={}", csd_job_id, bits, to_hex(&target));
+                println!("[upstream] job={} bits={:08x} target={}",
+                    csd_job_id, bits, to_hex(&target));
 
                 let notify_str = serde_json::to_string(&make_notify(&job, clean)).unwrap() + "\n";
                 let mut cs = asic_clients.lock().unwrap();
@@ -286,23 +284,21 @@ fn main() {
         let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
         println!("[proxy] ASIC connected: {}", peer);
 
-        let w           = Arc::new(Mutex::new(stream.try_clone().unwrap()));
-        let w_clone     = w.clone();
+        let w            = Arc::new(Mutex::new(stream.try_clone().unwrap()));
+        let w_clone      = w.clone();
         asic_clients.lock().unwrap().push(w.clone());
 
-        let current_job = current_job.clone();
-        let recent_jobs = recent_jobs.clone();
-        let up_writer   = up_writer.clone();
-        let proxy_pass  = proxy_password.clone();
-        let peer_str    = peer.clone();
+        let current_job      = current_job.clone();
+        let recent_jobs      = recent_jobs.clone();
+        let up_writer        = up_writer.clone();
+        let proxy_pass       = proxy_password.clone();
+        let upstream_en1     = upstream_en1.clone();
+        let peer_str         = peer.clone();
 
         thread::spawn(move || {
             let reader = BufReader::new(stream);
             let mut msg_id: u64 = 100;
             let mut authorized = false;
-            // Fixed en1 we assign to this ASIC â must match what we use in merkle reconstruction
-            let en1: Vec<u8> = vec![0x00, 0x00, 0x00, 0x01];
-            let en1_hex = to_hex(&en1);
 
             for line in reader.lines() {
                 let line = match line { Ok(l) => l, Err(_) => break };
@@ -318,9 +314,16 @@ fn main() {
 
                 match method {
                     "mining.subscribe" => {
+                        // Give ASIC the real upstream en1
+                        let en1     = upstream_en1.lock().unwrap().clone();
+                        let en1_hex = to_hex(&en1);
                         send_msg(&w_clone, json!({
                             "id": id,
-                            "result": [[["mining.set_difficulty","d"],["mining.notify","n"]], en1_hex, 4],
+                            "result": [
+                                [["mining.set_difficulty","d"],["mining.notify","n"]],
+                                en1_hex,
+                                4
+                            ],
                             "error": null
                         }));
                         send_msg(&w_clone, json!({
@@ -331,6 +334,7 @@ fn main() {
                         if let Some(job) = current_job.lock().unwrap().as_ref() {
                             send_msg(&w_clone, make_notify(job, true));
                         }
+                        println!("[proxy] {peer_str} subscribed en1={}", to_hex(&upstream_en1.lock().unwrap()));
                     }
 
                     "mining.authorize" => {
@@ -374,22 +378,19 @@ fn main() {
                             None => { continue; }
                         };
 
+                        // Use the real upstream en1 for merkle reconstruction
+                        let en1    = upstream_en1.lock().unwrap().clone();
                         let en2    = from_hex(&en2_hex);
                         let ntime32 = u32::from_str_radix(&ntime_hex, 16).unwrap_or(0);
 
-                        // Nonce: ASIC sends raw LE bytes as hex string
-                        // e.g. "81363301" = bytes [0x81, 0x36, 0x33, 0x01]
-                        // These go directly into header[80..84] as-is
+                        // Nonce: raw LE bytes as sent by ASIC
                         let nonce_raw = from_hex(&nonce_hex);
                         if nonce_raw.len() != 4 { continue; }
                         let mut nonce_bytes = [0u8; 4];
                         nonce_bytes.copy_from_slice(&nonce_raw);
 
-                        // Reconstruct merkle with actual en1+en2 from this share
                         let merkle  = reconstruct_merkle(&job, &en1, &en2);
-                        // Build full 84-byte CSD header
                         let csd_hdr = build_csd_header(&job, &merkle, ntime32, &nonce_bytes);
-                        // Hash it
                         let hash    = sha256d(&csd_hdr);
 
                         println!("[submit] nonce={} hash={} target={}",
@@ -398,17 +399,15 @@ fn main() {
                         if hash_meets_target(&hash, &job.target) {
                             println!("[BLOCK!] hash={} nonce={}", to_hex(&hash), nonce_hex);
 
-                            // Submit to CSD upstream
-                            // nonce in CSD stratum submit = raw LE hex (same as ASIC sent us)
                             let mut s = serde_json::to_string(&json!({
                                 "id": msg_id,
                                 "method": "mining.submit",
                                 "params": [
                                     "asic-proxy",
                                     job.csd_job_id,
-                                    job.en2_hex,
-                                    job.ntime_hex,
-                                    nonce_hex  // raw LE bytes, as-is
+                                    en2_hex,      // pass actual en2 from ASIC
+                                    ntime_hex,    // pass actual ntime from ASIC
+                                    nonce_hex     // raw LE bytes as-is
                                 ]
                             })).unwrap();
                             s.push('\n');
