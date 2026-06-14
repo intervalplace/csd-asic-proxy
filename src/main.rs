@@ -1,19 +1,5 @@
 // csd-asic-proxy/src/main.rs
-//
-// Stratum v1 proxy: S21/S9 ASIC <-> CSD stratum node.
-//
-// Key insight from stratum.rs validate_and_submit:
-//   1. coinbase = coinbase1 || worker.extranonce1 || en2 || coinbase2
-//   2. cb_tx = bincode::deserialize(coinbase)
-//   3. cb_txid = sha256d(bincode::serialize(stripped_cb_tx))
-//      For coinbase, script_sig is NOT stripped (is_coinbase_input = true)
-//      So cb_txid = sha256d(bincode::serialize(cb_tx))
-//   4. merkle = merkle_root_txids([cb_txid, ...branch...])
-//   5. hdr = BlockHeader { version, prev, merkle, time: ntime as u64, bits, nonce }
-//   6. h = header_hash(hdr) = sha256d(84-byte buf)
-//
-// stratum_prev_hash does word-swap on send. Proxy receives already-swapped prev_hash.
-// We must un-swap it before putting into the header.
+// With heavy debug logging to diagnose hash mismatch
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -21,6 +7,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use bincode::Options as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -59,7 +46,6 @@ fn hash_meets_target(hash: &[u8; 32], target: &[u8; 32]) -> bool {
     hash <= target
 }
 
-// stratum_prev_hash does word-swap. We receive swapped bytes, must un-swap.
 fn unswap_prev_hash(swapped: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     if swapped.len() != 32 { return out; }
@@ -72,41 +58,26 @@ fn unswap_prev_hash(swapped: &[u8]) -> [u8; 32] {
     out
 }
 
-// For sending to ASIC â apply the Bitcoin word-swap (same as stratum_prev_hash)
-fn btc_prev_hash_hex(h: &[u8; 32]) -> String {
-    let mut out = [0u8; 32];
-    for i in 0..8 {
-        out[i*4]   = h[i*4+3];
-        out[i*4+1] = h[i*4+2];
-        out[i*4+2] = h[i*4+1];
-        out[i*4+3] = h[i*4  ];
-    }
-    to_hex(&out)
-}
-
-// ââ Consensus types matching src/types/mod.rs âââââââââââââââââââââââââââââââââ
-// Must match exactly for bincode serialization to produce same txid.
-
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 struct OutPoint {
     txid: [u8; 32],
     vout: u32,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 struct TxIn {
     prevout: OutPoint,
     #[serde(with = "serde_bytes")]
     script_sig: Vec<u8>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 struct TxOut {
     value: u64,
     script_pubkey: [u8; 20],
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 enum AppPayload {
     None,
     Propose {
@@ -122,7 +93,7 @@ enum AppPayload {
     },
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 struct Transaction {
     version: u32,
     inputs: Vec<TxIn>,
@@ -132,17 +103,34 @@ struct Transaction {
 }
 
 fn consensus_opts() -> impl bincode::Options {
-    use bincode::Options;
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
         .with_little_endian()
 }
 
-fn coinbase_txid(cb_bytes: &[u8]) -> Option<[u8; 32]> {
-    let tx: Transaction = consensus_opts().deserialize(cb_bytes).ok()?;
-    // For coinbase (prevout.txid=[0;32], vout=u32::MAX), script_sig is NOT stripped
+fn coinbase_txid(cb_bytes: &[u8], debug: bool) -> Option<[u8; 32]> {
+    let tx: Transaction = match consensus_opts().deserialize(cb_bytes) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[coinbase] deserialize failed: {e}");
+            eprintln!("[coinbase] bytes={}", to_hex(cb_bytes));
+            return None;
+        }
+    };
+    if debug {
+        println!("[coinbase] tx={:?}", tx);
+    }
     let serialized = consensus_opts().serialize(&tx).ok()?;
-    Some(sha256d(&serialized))
+    if debug {
+        println!("[coinbase] serialized={}", to_hex(&serialized));
+        println!("[coinbase] raw_cb    ={}", to_hex(cb_bytes));
+        println!("[coinbase] same={}", serialized == cb_bytes);
+    }
+    let txid = sha256d(&serialized);
+    if debug {
+        println!("[coinbase] txid={}", to_hex(&txid));
+    }
+    Some(txid)
 }
 
 fn merkle_root(txids: &[[u8; 32]]) -> [u8; 32] {
@@ -173,7 +161,6 @@ fn build_csd_header(
     hdr[0..4].copy_from_slice(&version.to_le_bytes());
     hdr[4..36].copy_from_slice(prev);
     hdr[36..68].copy_from_slice(merkle);
-    // time = ntime as u64 (from validate_and_submit: time: ntime as u64)
     hdr[68..76].copy_from_slice(&(ntime32 as u64).to_le_bytes());
     hdr[76..80].copy_from_slice(&bits.to_le_bytes());
     hdr[80..84].copy_from_slice(&nonce_u32.to_le_bytes());
@@ -188,18 +175,16 @@ fn send_msg(w: &Arc<Mutex<TcpStream>>, v: Value) {
 
 #[derive(Clone, Debug)]
 struct Job {
-    proxy_job_id:  String,
-    csd_job_id:    String,
-    target:        [u8; 32],
-    ntime_hex:     String,
-    coinbase1:     Vec<u8>,
-    coinbase2:     Vec<u8>,
-    merkle_branch: Vec<[u8; 32]>,
-    version:       u32,
-    bits:          u32,
-    // Real prev hash (unswapped, ready for header_hash)
-    prev:          [u8; 32],
-    // prev hash swapped for sending to ASIC
+    proxy_job_id:     String,
+    csd_job_id:       String,
+    target:           [u8; 32],
+    ntime_hex:        String,
+    coinbase1:        Vec<u8>,
+    coinbase2:        Vec<u8>,
+    merkle_branch:    Vec<[u8; 32]>,
+    version:          u32,
+    bits:             u32,
+    prev:             [u8; 32],
     prev_swapped_hex: String,
 }
 
@@ -293,17 +278,16 @@ fn main() {
                     Some(p) if p.len() >= 9 => p.clone(), _ => continue,
                 };
 
-                let csd_job_id      = p[0].as_str().unwrap_or("").to_string();
-                let prev_hash_hex   = p[1].as_str().unwrap_or("");
-                let coinbase1       = from_hex(p[2].as_str().unwrap_or(""));
-                let coinbase2       = from_hex(p[3].as_str().unwrap_or(""));
-                let version         = u32::from_str_radix(p[5].as_str().unwrap_or("1"), 16).unwrap_or(1);
-                let bits            = u32::from_str_radix(p[6].as_str().unwrap_or("0"), 16).unwrap_or(0);
-                let ntime_str       = p[7].as_str().unwrap_or("0").to_string();
-                let clean           = p[8].as_bool().unwrap_or(false);
+                let csd_job_id    = p[0].as_str().unwrap_or("").to_string();
+                let prev_hash_hex = p[1].as_str().unwrap_or("");
+                let coinbase1     = from_hex(p[2].as_str().unwrap_or(""));
+                let coinbase2     = from_hex(p[3].as_str().unwrap_or(""));
+                let version       = u32::from_str_radix(p[5].as_str().unwrap_or("1"), 16).unwrap_or(1);
+                let bits          = u32::from_str_radix(p[6].as_str().unwrap_or("0"), 16).unwrap_or(0);
+                let ntime_str     = p[7].as_str().unwrap_or("0").to_string();
+                let ntime32       = u32::from_str_radix(&ntime_str, 16).unwrap_or(0);
+                let clean         = p[8].as_bool().unwrap_or(false);
 
-                // prev_hash from stratum is already word-swapped.
-                // Un-swap to get the real prev hash for header construction.
                 let prev_swapped_bytes = from_hex(prev_hash_hex);
                 let mut prev_swapped = [0u8; 32];
                 if prev_swapped_bytes.len() == 32 { prev_swapped.copy_from_slice(&prev_swapped_bytes); }
@@ -317,7 +301,18 @@ fn main() {
 
                 let target   = bits_to_target(bits);
                 let en2_size = *upstream_en2_size.lock().unwrap();
-                let _ = en2_size;
+                let en1      = upstream_en1.lock().unwrap().clone();
+
+                // Debug: compute expected merkle for en2=zeros to verify coinbase parsing
+                let en2_zeros = vec![0u8; en2_size];
+                let mut cb_debug = Vec::new();
+                cb_debug.extend_from_slice(&coinbase1);
+                cb_debug.extend_from_slice(&en1);
+                cb_debug.extend_from_slice(&en2_zeros);
+                cb_debug.extend_from_slice(&coinbase2);
+                println!("[job] cb1={} cb2={}", to_hex(&coinbase1), to_hex(&coinbase2));
+                println!("[job] coinbase_bytes={}", to_hex(&cb_debug));
+                coinbase_txid(&cb_debug, true); // debug print
 
                 seq += 1;
                 let proxy_job_id = format!("{:08x}", seq);
@@ -326,7 +321,7 @@ fn main() {
                     proxy_job_id: proxy_job_id.clone(),
                     csd_job_id:   csd_job_id.clone(),
                     target,
-                    ntime_hex:    ntime_str,
+                    ntime_hex:    ntime_str.clone(),
                     coinbase1,
                     coinbase2,
                     merkle_branch,
@@ -336,7 +331,8 @@ fn main() {
                     prev_swapped_hex: prev_hash_hex.to_string(),
                 };
 
-                println!("[upstream] job={} bits={:08x}", csd_job_id, bits);
+                println!("[upstream] job={} bits={:08x} ntime={} prev_raw={} prev_unswapped={}",
+                    csd_job_id, bits, ntime_str, prev_hash_hex, to_hex(&prev));
 
                 let notify_str = serde_json::to_string(&make_notify(&job, clean)).unwrap() + "\n";
                 let mut cs = asic_clients.lock().unwrap();
@@ -374,6 +370,7 @@ fn main() {
             let reader = BufReader::new(stream);
             let mut msg_id: u64 = 100;
             let mut authorized = false;
+            let mut debug_once = true;
 
             for line in reader.lines() {
                 let line = match line { Ok(l) => l, Err(_) => break };
@@ -434,61 +431,69 @@ fn main() {
                         let ntime_hex    = params[3].as_str().unwrap_or("").to_string();
                         let nonce_hex    = params[4].as_str().unwrap_or("").to_string();
 
-                        // Always accept from ASIC
                         send_msg(&w_clone, json!({"id":id,"result":true,"error":null}));
 
                         let job = match recent_jobs.lock().unwrap().get(&proxy_job_id).cloned() {
                             Some(j) => j, None => continue,
                         };
 
-                        let en1     = upstream_en1.lock().unwrap().clone();
-                        let en2     = from_hex(&en2_hex);
-                        let ntime32 = u32::from_str_radix(&ntime_hex, 16).unwrap_or(0);
+                        let en1       = upstream_en1.lock().unwrap().clone();
+                        let en2       = from_hex(&en2_hex);
+                        let ntime32   = u32::from_str_radix(&ntime_hex, 16).unwrap_or(0);
                         let nonce_u32 = u32::from_str_radix(&nonce_hex, 16).unwrap_or(0);
 
-                        // Reconstruct coinbase bytes
                         let mut cb_bytes = Vec::new();
                         cb_bytes.extend_from_slice(&job.coinbase1);
                         cb_bytes.extend_from_slice(&en1);
                         cb_bytes.extend_from_slice(&en2);
                         cb_bytes.extend_from_slice(&job.coinbase2);
 
-                        // Compute coinbase txid using bincode (matching validate_and_submit)
-                        let cb_txid = match coinbase_txid(&cb_bytes) {
+                        let do_debug = debug_once;
+                        let cb_txid = match coinbase_txid(&cb_bytes, do_debug) {
                             Some(t) => t,
                             None => {
                                 eprintln!("[proxy] {peer_str} failed to deserialize coinbase");
                                 continue;
                             }
                         };
+                        if do_debug {
+                            debug_once = false;
+                            println!("[debug] en1={} en2={}", to_hex(&en1), to_hex(&en2));
+                            println!("[debug] cb_bytes={}", to_hex(&cb_bytes));
+                            println!("[debug] cb_txid={}", to_hex(&cb_txid));
+                            println!("[debug] prev_unswapped={}", to_hex(&job.prev));
+                            println!("[debug] ntime32={:08x} bits={:08x} nonce_u32={:08x}",
+                                ntime32, job.bits, nonce_u32);
+                        }
 
-                        // Build merkle root
                         let mut all_txids = vec![cb_txid];
                         all_txids.extend_from_slice(&job.merkle_branch);
-                        let merkle_root = merkle_root(&all_txids);
+                        let merkle = merkle_root(&all_txids);
 
-                        // Build 84-byte CSD header
+                        if do_debug {
+                            println!("[debug] merkle={}", to_hex(&merkle));
+                        }
+
                         let csd_hdr = build_csd_header(
-                            job.version, &job.prev, &merkle_root, ntime32, job.bits, nonce_u32
+                            job.version, &job.prev, &merkle, ntime32, job.bits, nonce_u32
                         );
                         let hash = sha256d(&csd_hdr);
+
+                        if do_debug {
+                            println!("[debug] csd_hdr={}", to_hex(&csd_hdr));
+                            println!("[debug] hash={}", to_hex(&hash));
+                        }
 
                         println!("[submit] nonce={} hash={} target={}",
                             nonce_hex, to_hex(&hash), to_hex(&job.target));
 
                         if hash_meets_target(&hash, &job.target) {
                             println!("[BLOCK!] hash={}", to_hex(&hash));
-
                             let mut s = serde_json::to_string(&json!({
                                 "id": msg_id,
                                 "method": "mining.submit",
-                                "params": [
-                                    "asic-proxy",
-                                    job.csd_job_id,
-                                    en2_hex,
-                                    ntime_hex,
-                                    format!("{:08x}", nonce_u32)
-                                ]
+                                "params": ["asic-proxy", job.csd_job_id, en2_hex, ntime_hex,
+                                           format!("{:08x}", nonce_u32)]
                             })).unwrap();
                             s.push('\n');
                             msg_id += 1;
