@@ -375,17 +375,18 @@ send_msg(&w_job, json!({"id":null,"method":"mining.set_difficulty","params":[100
                         let en2    = from_hex(&en2_hex);
                         let ntime32 = u32::from_str_radix(&ntime_hex, 16).unwrap_or(0);
                         let nb     = from_hex(&nonce_hex);
-                        let nonce_be = if nb.len() == 4 {
-                            u32::from_be_bytes([nb[0],nb[1],nb[2],nb[3]])
-                        } else { 0 };
+
+let nonce_le = if nb.len() == 4 {
+    u32::from_le_bytes([nb[0],nb[1],nb[2],nb[3]])
+} else { 0 };
 
                         let merkle  = reconstruct_merkle(&job, &en1, &en2);
-                        let csd_hdr = build_csd_header(&job, &merkle, ntime32, nonce_be);
+                        let csd_hdr = build_csd_header(&job, &merkle, ntime32, nonce_le);
                         let hash    = sha256d(&csd_hdr);
 
                         if hash_meets_target(&hash, &job.target) {
                             println!("[BLOCK!] hash={}", to_hex(&hash));
-                            let nonce_le = to_hex(&nonce_be.to_le_bytes());
+                            let nonce_le = to_hex(&nonce_le.to_le_bytes());
                             let mut s = serde_json::to_string(&json!({
                                 "id": msg_id,
                                 "method": "mining.submit",
