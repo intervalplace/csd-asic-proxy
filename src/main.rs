@@ -324,7 +324,9 @@ fn main() {
                             "result": [[["mining.set_difficulty","d"],["mining.notify","n"]], en1_hex, 4],
                             "error": null
                         }));
-                        send_msg(&w_job, json!({"id":null,"method":"mining.set_difficulty","params":[1.0]}));
+
+send_msg(&w_job, json!({"id":null,"method":"mining.set_difficulty","params":[1000000.0]}));
+
                         if let Some(job) = current_job.lock().unwrap().as_ref() {
                             send_msg(&w_job, make_notify(job, true));
                         }
