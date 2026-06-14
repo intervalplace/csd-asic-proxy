@@ -8,9 +8,12 @@
 //   [36..68] merkle   [u8;32]
 //   [68..76] time     u64 LE
 //   [76..80] bits     u32 LE
-//   [80..84] nonce    u32 LE
+//   [80..84] nonce    u32 LE  <-- nonce stored as LE bytes
 //
-// CRITICAL: we forward the real upstream en1 to the ASIC so merkle roots match.
+// ASIC sends nonce as big-endian hex string.
+// e.g. nonce_hex="372057e1" means the u32 value 0x372057e1
+// which as LE bytes = [0xe1, 0x57, 0x20, 0x37] in the header.
+// CSD stratum submit also expects nonce as LE hex.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -121,7 +124,10 @@ fn reconstruct_merkle(job: &Job, en1: &[u8], en2: &[u8]) -> [u8; 32] {
     cur
 }
 
-fn build_csd_header(job: &Job, merkle: &[u8; 32], ntime32: u32, nonce_bytes: &[u8; 4]) -> [u8; 84] {
+// Build the 84-byte CSD header exactly as header_hash() expects.
+// nonce_u32: the nonce value parsed from ASIC's big-endian hex.
+// header_hash stores nonce as u32 LE bytes.
+fn build_csd_header(job: &Job, merkle: &[u8; 32], ntime32: u32, nonce_u32: u32) -> [u8; 84] {
     let mut hdr = [0u8; 84];
     hdr[0..4].copy_from_slice(&job.version.to_le_bytes());
     hdr[4..36].copy_from_slice(&job.prev);
@@ -130,7 +136,8 @@ fn build_csd_header(job: &Job, merkle: &[u8; 32], ntime32: u32, nonce_bytes: &[u
     let full_time: u64 = ((time_hi as u64) << 32) | (ntime32 as u64);
     hdr[68..76].copy_from_slice(&full_time.to_le_bytes());
     hdr[76..80].copy_from_slice(&job.bits.to_le_bytes());
-    hdr[80..84].copy_from_slice(nonce_bytes);
+    // nonce stored as u32 LE â matches header_hash() which does h.nonce.to_le_bytes()
+    hdr[80..84].copy_from_slice(&nonce_u32.to_le_bytes());
     hdr
 }
 
@@ -152,7 +159,7 @@ fn main() {
     let recent_jobs: Arc<Mutex<HashMap<String, Job>>> = Arc::new(Mutex::new(HashMap::new()));
     let asic_clients: Arc<Mutex<Vec<Arc<Mutex<TcpStream>>>>> = Arc::new(Mutex::new(Vec::new()));
 
-    // Shared upstream en1 â set once on subscribe, read by ASIC handlers
+    // Shared upstream en1 â set once on subscribe response, read by ASIC handlers
     let upstream_en1: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![0u8; 4]));
     let upstream_en2_size: Arc<Mutex<usize>> = Arc::new(Mutex::new(4));
 
@@ -173,12 +180,12 @@ fn main() {
 
     // Upstream reader thread
     {
-        let current_job      = current_job.clone();
-        let recent_jobs      = recent_jobs.clone();
-        let asic_clients     = asic_clients.clone();
-        let upstream_en1     = upstream_en1.clone();
+        let current_job       = current_job.clone();
+        let recent_jobs       = recent_jobs.clone();
+        let asic_clients      = asic_clients.clone();
+        let upstream_en1      = upstream_en1.clone();
         let upstream_en2_size = upstream_en2_size.clone();
-        let up_reader        = up_stream;
+        let up_reader         = up_stream;
 
         thread::spawn(move || {
             let reader = BufReader::new(up_reader);
@@ -191,7 +198,7 @@ fn main() {
                 let method = msg.get("method").and_then(|v| v.as_str()).unwrap_or("");
 
                 if method.is_empty() {
-                    // Subscribe response â extract en1 and en2_size
+                    // Subscribe response
                     if let Some(arr) = msg.get("result").and_then(|v| v.as_array()) {
                         if arr.len() >= 3 {
                             let en1_hex  = arr[1].as_str().unwrap_or("").to_string();
@@ -314,7 +321,6 @@ fn main() {
 
                 match method {
                     "mining.subscribe" => {
-                        // Give ASIC the real upstream en1
                         let en1     = upstream_en1.lock().unwrap().clone();
                         let en1_hex = to_hex(&en1);
                         send_msg(&w_clone, json!({
@@ -378,23 +384,28 @@ fn main() {
                             None => { continue; }
                         };
 
-                        // Use the real upstream en1 for merkle reconstruction
-                        let en1    = upstream_en1.lock().unwrap().clone();
-                        let en2    = from_hex(&en2_hex);
+                        let en1     = upstream_en1.lock().unwrap().clone();
+                        let en2     = from_hex(&en2_hex);
                         let ntime32 = u32::from_str_radix(&ntime_hex, 16).unwrap_or(0);
 
-                        // Nonce: raw LE bytes as sent by ASIC
-                        let nonce_raw = from_hex(&nonce_hex);
-                        if nonce_raw.len() != 4 { continue; }
-                        let mut nonce_bytes = [0u8; 4];
-                        nonce_bytes.copy_from_slice(&nonce_raw);
+                        // ASIC sends nonce as big-endian hex.
+                        // e.g. "372057e1" = u32 value 0x372057e1
+                        // header_hash stores nonce as nonce_u32.to_le_bytes()
+                        // so we parse as BE to get the u32, then to_le_bytes() for the header.
+                        let nonce_u32 = u32::from_str_radix(&nonce_hex, 16).unwrap_or(0);
+
+                        // CSD stratum submit expects nonce as LE hex
+                        // (validate_and_submit does u32::from_str_radix which treats it as BE number,
+                        //  then stores as nonce u32, then header_hash does .to_le_bytes())
+                        // So we send the same hex string â stratum parses it as the u32 value.
+                        let nonce_submit_hex = format!("{:08x}", nonce_u32);
 
                         let merkle  = reconstruct_merkle(&job, &en1, &en2);
-                        let csd_hdr = build_csd_header(&job, &merkle, ntime32, &nonce_bytes);
+                        let csd_hdr = build_csd_header(&job, &merkle, ntime32, nonce_u32);
                         let hash    = sha256d(&csd_hdr);
 
-                        println!("[submit] nonce={} hash={} target={}",
-                            nonce_hex, to_hex(&hash), to_hex(&job.target));
+                        println!("[submit] nonce={} nonce_u32={:08x} hash={} target={}",
+                            nonce_hex, nonce_u32, to_hex(&hash), to_hex(&job.target));
 
                         if hash_meets_target(&hash, &job.target) {
                             println!("[BLOCK!] hash={} nonce={}", to_hex(&hash), nonce_hex);
@@ -405,9 +416,9 @@ fn main() {
                                 "params": [
                                     "asic-proxy",
                                     job.csd_job_id,
-                                    en2_hex,      // pass actual en2 from ASIC
-                                    ntime_hex,    // pass actual ntime from ASIC
-                                    nonce_hex     // raw LE bytes as-is
+                                    en2_hex,
+                                    ntime_hex,
+                                    nonce_submit_hex
                                 ]
                             })).unwrap();
                             s.push('\n');
