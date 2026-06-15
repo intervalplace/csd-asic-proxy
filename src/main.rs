@@ -133,24 +133,18 @@ fn coinbase_txid(cb_bytes: &[u8], debug: bool) -> Option<[u8; 32]> {
     Some(txid)
 }
 
-fn merkle_root(txids: &[[u8; 32]]) -> [u8; 32] {
-    if txids.is_empty() { return [0u8; 32]; }
-    let mut layer = txids.to_vec();
-    while layer.len() > 1 {
-        let mut next = Vec::with_capacity((layer.len() + 1) / 2);
-        let mut i = 0;
-        while i < layer.len() {
-            let l = layer[i];
-            let r = if i + 1 < layer.len() { layer[i+1] } else { layer[i] };
-            let mut buf = [0u8; 64];
-            buf[..32].copy_from_slice(&l);
-            buf[32..].copy_from_slice(&r);
-            next.push(sha256d(&buf));
-            i += 2;
-        }
-        layer = next;
+/// Apply stratum merkle branch to a coinbase txid to get the block merkle root.
+/// The branch contains pre-hashed sibling nodes (NOT raw txids), so we simply
+/// walk the path: current = sha256d(current || branch[i]) for each step.
+fn apply_merkle_branch(cb_txid: &[u8; 32], branch: &[[u8; 32]]) -> [u8; 32] {
+    let mut cur = *cb_txid;
+    for sibling in branch {
+        let mut buf = [0u8; 64];
+        buf[..32].copy_from_slice(&cur);
+        buf[32..].copy_from_slice(sibling);
+        cur = sha256d(&buf);
     }
-    layer[0]
+    cur
 }
 
 fn build_csd_header(
@@ -392,7 +386,7 @@ fn main() {
                             "result": [[["mining.set_difficulty","d"],["mining.notify","n"]], en1_hex, 4],
                             "error": null
                         }));
-                        send_msg(&w_clone, json!({"id":null,"method":"mining.set_difficulty","params":[100000.0]}));
+                        send_msg(&w_clone, json!({"id":null,"method":"mining.set_difficulty","params":[1000000.0]}));
                         if let Some(job) = current_job.lock().unwrap().as_ref() {
                             send_msg(&w_clone, make_notify(job, true));
                         }
@@ -466,9 +460,7 @@ fn main() {
                                 ntime32, job.bits, nonce_u32);
                         }
 
-                        let mut all_txids = vec![cb_txid];
-                        all_txids.extend_from_slice(&job.merkle_branch);
-                        let merkle = merkle_root(&all_txids);
+                        let merkle = apply_merkle_branch(&cb_txid, &job.merkle_branch);
 
                         if do_debug {
                             println!("[debug] merkle={}", to_hex(&merkle));
